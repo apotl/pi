@@ -388,6 +388,14 @@ export class AgentSession {
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
 	private _agentRunAbortRequested = false;
+	/**
+	 * Aborts the run-starting window (compaction check + before_agent_start handlers). The agent's
+	 * own signal only exists once agent.prompt() has started the run, so handlers that block
+	 * before that (e.g. waiting on an external lock) have nothing to observe a user abort on; this
+	 * controller bridges that gap and is exposed as ctx.signal until the run exists. Aborted from
+	 * abort() and dispose().
+	 */
+	private _preStartAbortController?: AbortController;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -1400,6 +1408,7 @@ export class AgentSession {
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
+			this._preStartAbortController?.abort();
 			this.agent.abort();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
@@ -1832,34 +1841,38 @@ export class AgentSession {
 	 * Start a run from a user or custom message. The session counts as busy from here on, so
 	 * messages sent while before_agent_start handlers run are queued into this run instead of
 	 * starting another, and an abort requested meanwhile aborts the run as soon as it exists.
+	 * While the run is starting, ctx.signal is defined and aborts on such a request, so a handler
+	 * that blocks (e.g. waiting on an external lock) can observe the abort and back off.
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
+		this._preStartAbortController = new AbortController();
 		let messages: AgentMessage[];
 		try {
 			messages = await this._prepareRun(trigger);
 		} catch (error) {
 			this._isAgentRunActive = false;
+			this._preStartAbortController = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
 			this._resolveIdleWaitIfIdle();
 			throw error;
 		}
-		// Messages held while the run was starting go before its starting messages, as they would
-		// have while idle. No run exists yet, so they cannot split a tool call from its result.
-		this._flushPendingBashMessages();
-		this._flushPendingCustomMessages();
-		onStarted?.();
-
-		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
-		this._failedResponse = undefined;
-		this._recordSelection();
-		// The run records the loadout in the transcript; restored tools that did not register by now
-		// are dropped, so a tool that never registers does not stay pending.
-		this._pendingToolNames.clear();
 		try {
+			// Messages held while the run was starting go before its starting messages, as they would
+			// have while idle. No run exists yet, so they cannot split a tool call from its result.
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			onStarted?.();
+
+			// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
+			this._failedResponse = undefined;
+			this._recordSelection();
+			// The run records the loadout in the transcript; restored tools that did not register by now
+			// are dropped, so a tool that never registers does not stay pending.
+			this._pendingToolNames.clear();
 			await this.agent.prompt(messages);
 			while (!this._agentRunAbortRequested) {
 				if (await this._handlePostAgentRun()) {
@@ -1873,6 +1886,7 @@ export class AgentSession {
 			}
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+			this._preStartAbortController = undefined;
 			this._failedResponse = undefined;
 			this._runSystemPromptOptions = undefined;
 			this._flushPendingBashMessages();
@@ -2465,6 +2479,9 @@ export class AgentSession {
 		if (this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
 		}
+		// Interrupt the run-starting window so a blocking before_agent_start handler can
+		// observe the abort via ctx.signal; the run is then dropped before the first request.
+		this._preStartAbortController?.abort();
 		this.abortRetry();
 		this.abortCompaction();
 		this.abortBranchSummary();
@@ -3468,7 +3485,7 @@ export class AgentSession {
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
-				getSignal: () => this.agent.signal,
+				getSignal: () => this.agent.signal ?? this._preStartAbortController?.signal,
 				abort: () => {
 					if (this._extensionAbortHandler) {
 						this._extensionAbortHandler();

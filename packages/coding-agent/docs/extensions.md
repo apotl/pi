@@ -60,7 +60,7 @@ Start long-lived resources from `session_start` or from the command or tool that
 Close session-scoped resources from an idempotent `session_shutdown` handler.
 
 A run proceeds from input and `before_agent_start`, through model, message, and tool events, to `agent_end`.
-Pi counts as busy while a run starts, including the compaction check and `before_agent_start`, so messages sent meanwhile go into the starting run.
+Pi counts as busy while a run starts, including the compaction check and `before_agent_start`, so messages sent meanwhile go into the starting run. The extension context's `signal` is defined while the run starts and aborts if the user cancels meanwhile, so a handler that blocks on pre-start work (for example, waiting on an external lock) can observe the abort, release its wait, and let the cancelled run stop before the first request.
 Automatic retries, recovery, compaction, or queued work can continue afterward.
 <a id="agent_start--agent_end--agent_before_settle--agent_settled"></a>
 
