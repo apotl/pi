@@ -719,5 +719,42 @@ describe("AgentSession prompt characterization", () => {
 			expect(last?.role === "assistant" && last.stopReason).toBe("aborted");
 			expect(harness.session.isIdle).toBe(true);
 		});
+
+		it("exposes an abortable signal to before_agent_start so a blocked handler observes the abort", async () => {
+			let observeSignal: (signal: AbortSignal | undefined) => void;
+			const signalObserved = new Promise<AbortSignal | undefined>((resolve) => {
+				observeSignal = resolve;
+			});
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", async (_event, ctx) => {
+							observeSignal(ctx.signal);
+							// Block until the signal aborts, like a turn-lock waiter does. If the
+							// signal were undefined this would hang and the test would time out.
+							await new Promise<void>((resolve) => {
+								ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+							});
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("should never be requested")]);
+
+			const run = harness.session.prompt("hello");
+			const signal = await signalObserved;
+			expect(signal).toBeInstanceOf(AbortSignal);
+			expect(signal?.aborted).toBe(false);
+
+			const aborted = harness.session.abort();
+			await Promise.all([run, aborted]);
+
+			expect(signal?.aborted).toBe(true);
+			expect(harness.session.isIdle).toBe(true);
+			const last = harness.session.messages.at(-1);
+			expect(last?.role).toBe("assistant");
+			expect(last?.role === "assistant" && last.stopReason).toBe("aborted");
+		});
 	});
 });
